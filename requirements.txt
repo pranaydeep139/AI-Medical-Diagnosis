@@ -1,0 +1,9 @@
+pandas
+numpy
+scikit-learn
+openai
+streamlit
+azure-ai-ml
+azure-identity
+azure-keyvault-secrets
+azure-storage-blob 
