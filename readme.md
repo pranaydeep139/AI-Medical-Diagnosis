@@ -128,6 +128,8 @@ User Browser  ↔  Streamlit App (App Service)
 
 5. **Browse** to `https://<app-name>.azurewebsites.net`.
 
+6. It is currently hosted at `https://diagnosisassistant-dkhsfqd5dwf5cycr.eastus2-01.azurewebsites.net/`
+
 ---
 
 ## 📈 Monitoring & Logs
