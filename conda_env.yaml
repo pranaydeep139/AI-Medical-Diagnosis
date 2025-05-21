@@ -1,0 +1,50 @@
+name: diagnosis-assistant
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Core Python
+  - python=3.12
+
+  # Data Science & ML - Try to get from Conda first
+  - pandas=2.2 # Conda might not have 2.2.3 exactly, 2.2 is a good target
+  - numpy=1.26 # Conda might have 1.26.x, which is compatible with 2.x.x for NumPy. If 2.x is on conda-forge use that.
+  - scikit-learn=1.4 # Conda might not have 1.6.1, 1.4 or 1.5 is more likely.
+  - joblib=1.4 # Conda might not have 1.5.0
+
+  # Streamlit
+  - streamlit=1.35 # Conda might not have 1.45.1 exactly
+
+  # HTTP client for AML endpoint
+  - requests # Generally available and stable
+
+  # Pip for packages that might be more specific or newer versions not on conda
+  - pip
+  - pip:
+    # If conda versions are too old, pip can install the exact ones.
+    # Example: If scikit-learn 1.4.x from conda is not 1.6.1, pip will try.
+    # However, mixing conda and pip for core libraries like numpy/scikit-learn
+    # can sometimes lead to issues if not careful. Prioritize Conda where possible.
+    # We will let conda install the closest it can for the above,
+    # and list the pip ones for things conda is less likely to have or for exact pinning if necessary.
+
+    - openai==1.17.0 # Adjusted based on typical availability, 1.79.0 is very new
+    - streamlit==1.35.0 # Pinning to a version likely available if Conda's is older
+                        # If conda's streamlit=1.35 is actually 1.35.0, this is fine.
+                        # If you absolutely need 1.45.1 and conda doesn't have it,
+                        # you might remove streamlit from conda deps and put it only in pip.
+    
+    # Azure SDKs (these are generally best installed via pip)
+    - azure-identity~=1.15.0
+    - azure-keyvault-secrets~=4.7.0
+    - azure-storage-blob~=12.19.0
+    # - azure-ai-ml # Only if your Streamlit app directly uses MLClient for something
+                      # (Your current app.py doesn't seem to, it only calls an endpoint)
+
+    # If conda versions for pandas, numpy, scikit-learn, joblib are not sufficient,
+    # you could uncomment these and remove them from the conda dependencies block above.
+    # However, this is generally less recommended if conda can provide compatible versions.
+    # - pandas==2.2.1 # example if conda only has 2.2.0 and you need 2.2.1
+    # - numpy==1.26.4  # example if conda only has 1.26.3 and you need 1.26.4
+    # - scikit-learn==1.4.2 # example if conda only has 1.4.0 and you need 1.4.2
+    # - joblib==1.4.0 # example

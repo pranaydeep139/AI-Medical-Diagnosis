@@ -17,6 +17,66 @@ from azure.storage.blob import BlobServiceClient
 
 ARTIFACTS_PATH = "app_artifacts"  # Path to the folder with JSON artifacts and model.pkl
 
+
+def get_azure_config():
+    """Fetches Azure OpenAI credentials from Key Vault or Streamlit secrets."""
+    config = {}
+    try:
+        key_vault_name = os.getenv("KEY_VAULT_NAME", None)
+        if not key_vault_name:
+            key_vault_name = st.secrets.get("AZURE_KEY_VAULT_NAME", None)
+        if key_vault_name:
+            print("🔑 Acquiring Azure Key Vault credentials...")
+            KVUri = f"https://{key_vault_name}.vault.azure.net"
+            credential = DefaultAzureCredential()
+            client = SecretClient(vault_url=KVUri, credential=credential)
+            config["azure_openai_key"] = client.get_secret("AZURE-OPENAI-KEY").value
+            config["azure_openai_endpoint"] = client.get_secret("AZURE-OPENAI-ENDPOINT").value
+            config["azure_openai_deployment_name"] = client.get_secret("AZURE-OPENAI-DEPLOYMENT-NAME").value
+            config["azure_storage_connection_string"] = client.get_secret("AZURE-STORAGE-CONNECTION-STRING").value
+            config["azure_storage_account_name"] = client.get_secret("AZURE-STORAGE-ACCOUNT-NAME").value
+            print("✅ Azure Key Vault credentials acquired.")
+        else:
+            print("🔑 Using Streamlit secrets for Azure OpenAI credentials...")
+            config["azure_openai_key"] = st.secrets["AZURE_OPENAI_KEY"]
+            config["azure_openai_endpoint"] = st.secrets["AZURE_OPENAI_ENDPOINT"]
+            config["azure_openai_deployment_name"] = st.secrets["AZURE_OPENAI_DEPLOYMENT_NAME"]
+            print("✅ Streamlit Secrets credentials loaded successfully.")
+        
+        st.session_state.secrets_loaded = True
+        return config
+
+    except Exception as e:
+        st.error(f"Could not load Azure OpenAI credentials: {e}")
+        st.info(
+            "Important: Please ensure your Azure OpenAI credentials (KEY, ENDPOINT, DEPLOYMENT_NAME) "
+            "are correctly set in Streamlit secrets or environment variables. "
+            "If using Key Vault, check its configuration and access permissions."
+        )
+        st.session_state.secrets_loaded = False
+        return None
+
+if 'app_initialized' not in st.session_state:
+    azure_config = get_azure_config()
+    if azure_config:
+        st.session_state.azure_storage_connection_string = azure_config["azure_storage_connection_string"]
+        st.session_state.azure_storage_account_name = azure_config["azure_storage_account_name"]
+    else:
+        st.session_state.azure_storage_connection_string = None
+        st.session_state.azure_storage_account_name = None
+    if st.session_state.get('secrets_loaded', False) and azure_config:
+        st.session_state.aoai_client = AzureOpenAI(
+            api_key=azure_config["azure_openai_key"],
+            api_version="2023-12-01-preview", 
+            azure_endpoint=azure_config["azure_openai_endpoint"]
+        )
+        st.session_state.aoai_deployment_name = azure_config["azure_openai_deployment_name"]
+    else:
+        st.session_state.aoai_client = None
+        st.session_state.aoai_deployment_name = None
+    st.session_state.app_initialized = True
+
+
 print("🟢 Starting blob artifacts download process...")
 
 # 1. Authenticate via DefaultAzureCredential
@@ -25,14 +85,15 @@ credential = DefaultAzureCredential()
 print("✅ Credential acquired.")
 
 # 2. Create BlobServiceClient via AAD
-account_url = f"https://{st.secrets['AZURE_STORAGE_ACCOUNT_NAME']}.blob.core.windows.net"
+acc_name = st.session_state.azure_storage_account_name
+account_url = f"https://{acc_name}.blob.core.windows.net"
 print(f"🌐 Connecting to BlobServiceClient at {account_url} using AAD...")
 service_client = BlobServiceClient(account_url=account_url, credential=credential)
 print("✅ AAD-based BlobServiceClient connected.")
 
 # 3. Fallback via connection string
 print("🔄 Overriding with connection string auth (if provided)...")
-conn_str = st.secrets.get("AZURE_STORAGE_CONNECTION_STRING", None)
+conn_str = st.session_state.azure_storage_connection_string
 if conn_str:
     service_client = BlobServiceClient.from_connection_string(conn_str)
     print("✅ BlobServiceClient initialized from connection string.")
@@ -78,49 +139,6 @@ for blob_name in artifact_files:
 
 print("🎉 All done with blob downloads!")
 
-def get_azure_config():
-    """Fetches Azure OpenAI credentials from Key Vault or Streamlit secrets."""
-    config = {}
-    try:
-        key_vault_name = st.secrets.get("AZURE_KEY_VAULT_NAME")
-        if key_vault_name:
-            KVUri = f"https://{key_vault_name}.vault.azure.net"
-            credential = DefaultAzureCredential()
-            client = SecretClient(vault_url=KVUri, credential=credential)
-            config["azure_openai_key"] = client.get_secret("AzureOpenAIKey").value
-            config["azure_openai_endpoint"] = client.get_secret("AzureOpenAIEndpoint").value
-            config["azure_openai_deployment_name"] = client.get_secret("AzureOpenAIDeploymentName").value
-        else:
-            config["azure_openai_key"] = st.secrets["AZURE_OPENAI_KEY"]
-            config["azure_openai_endpoint"] = st.secrets["AZURE_OPENAI_ENDPOINT"]
-            config["azure_openai_deployment_name"] = st.secrets["AZURE_OPENAI_DEPLOYMENT_NAME"]
-        
-        st.session_state.secrets_loaded = True
-        return config
-
-    except Exception as e:
-        st.error(f"Could not load Azure OpenAI credentials: {e}")
-        st.info(
-            "Important: Please ensure your Azure OpenAI credentials (KEY, ENDPOINT, DEPLOYMENT_NAME) "
-            "are correctly set in Streamlit secrets or environment variables. "
-            "If using Key Vault, check its configuration and access permissions."
-        )
-        st.session_state.secrets_loaded = False
-        return None
-
-if 'app_initialized' not in st.session_state:
-    azure_config = get_azure_config()
-    if st.session_state.get('secrets_loaded', False) and azure_config:
-        st.session_state.aoai_client = AzureOpenAI(
-            api_key=azure_config["azure_openai_key"],
-            api_version="2023-12-01-preview", 
-            azure_endpoint=azure_config["azure_openai_endpoint"]
-        )
-        st.session_state.aoai_deployment_name = azure_config["azure_openai_deployment_name"]
-    else:
-        st.session_state.aoai_client = None
-        st.session_state.aoai_deployment_name = None
-    st.session_state.app_initialized = True
 
 # --- Paste your full symptom_explanations dictionary here ---
 symptom_explanations = {
