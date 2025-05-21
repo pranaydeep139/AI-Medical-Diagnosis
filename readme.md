@@ -13,6 +13,7 @@ A Streamlit web application that uses a combination of Azure OpenAI and a local 
 * **Azure Integration**:
 
   * **OpenAI Service** for LLM integration.
+  * **Azure Key Valut Server** for storing connection strings and endpoints.
   * **Blob Storage** for artifact (model + JSON) hosting.
   * **Azure App Service** deployment with custom startup script.
 
@@ -25,7 +26,8 @@ User Browser  ↔  Streamlit App (App Service)
       ↕            │
       ↕            ├─ Azure OpenAI (chat completion)
       ↕            ├─ Local ML Model (joblib)
-      ↕            └─ Azure Blob Storage (model/artifacts)
+      ↕            ├─ Azure Blob Storage (model/artifacts)
+      ↕            └─ Azure Key Vault (secrets/configs)
 ```
 
 ---
@@ -35,12 +37,13 @@ User Browser  ↔  Streamlit App (App Service)
 1. **Azure Subscription** with:
 
    * An **App Service** (Linux, Python 3.10+, B1+ tier).
+   * A **Key Vault** with appropriate access controls.
    * A **Storage Account** with a private Blob container for your artifacts.
    * An **Azure OpenAI** resource & deployment.
 
 2. **Local / Dev Machine**:
 
-   * Python 3.10+ installed
+   * Python 3.10+ installed (3.12 preferred)
    * Azure CLI (`az`) and/or VS Code with Azure extensions for deployment
 
 ---
@@ -79,6 +82,10 @@ User Browser  ↔  Streamlit App (App Service)
    AZURE_STORAGE_CONNECTION_STRING = ""
    AZURE_STORAGE_ACCOUNT_NAME = ""
    ```
+
+   OR
+
+   Use Azure Key Vault to retrive secrets.
 
 5. **Run locally**:
 
@@ -127,8 +134,6 @@ User Browser  ↔  Streamlit App (App Service)
      ```
 
 5. **Browse** to `https://<app-name>.azurewebsites.net`.
-
-6. It is currently hosted at `https://diagnosisassistant-dkhsfqd5dwf5cycr.eastus2-01.azurewebsites.net/`
 
 ---
 

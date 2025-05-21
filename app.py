@@ -7,6 +7,7 @@ import json
 import os
 import joblib # For loading the .pkl model
 from collections import Counter, defaultdict
+import matplotlib.pyplot as plt # Added for bar chart
 
 # Azure SDKs
 from azure.identity import DefaultAzureCredential
@@ -41,6 +42,17 @@ def get_azure_config():
             config["azure_openai_key"] = st.secrets["AZURE_OPENAI_KEY"]
             config["azure_openai_endpoint"] = st.secrets["AZURE_OPENAI_ENDPOINT"]
             config["azure_openai_deployment_name"] = st.secrets["AZURE_OPENAI_DEPLOYMENT_NAME"]
+            # Attempt to get storage secrets from Streamlit secrets if Key Vault not used
+            if "AZURE_STORAGE_CONNECTION_STRING" in st.secrets and "AZURE_STORAGE_ACCOUNT_NAME" in st.secrets:
+                config["azure_storage_connection_string"] = st.secrets["AZURE_STORAGE_CONNECTION_STRING"]
+                config["azure_storage_account_name"] = st.secrets["AZURE_STORAGE_ACCOUNT_NAME"]
+                print("✅ Streamlit Secrets storage credentials loaded.")
+            else: # Fallback if not in secrets and not in keyvault (will cause issues later if needed but allows AOAI to work)
+                config["azure_storage_connection_string"] = None
+                config["azure_storage_account_name"] = None
+                print("⚠️ Streamlit Secrets storage credentials not found. Blob download might fail if AAD auth is not sufficient.")
+
+
             print("✅ Streamlit Secrets credentials loaded successfully.")
         
         st.session_state.secrets_loaded = True
@@ -51,7 +63,8 @@ def get_azure_config():
         st.info(
             "Important: Please ensure your Azure OpenAI credentials (KEY, ENDPOINT, DEPLOYMENT_NAME) "
             "are correctly set in Streamlit secrets or environment variables. "
-            "If using Key Vault, check its configuration and access permissions."
+            "If using Key Vault, check its configuration and access permissions. "
+            "Storage credentials (CONNECTION_STRING, ACCOUNT_NAME) are also needed."
         )
         st.session_state.secrets_loaded = False
         return None
@@ -59,12 +72,13 @@ def get_azure_config():
 if 'app_initialized' not in st.session_state:
     azure_config = get_azure_config()
     if azure_config:
-        st.session_state.azure_storage_connection_string = azure_config["azure_storage_connection_string"]
-        st.session_state.azure_storage_account_name = azure_config["azure_storage_account_name"]
+        st.session_state.azure_storage_connection_string = azure_config.get("azure_storage_connection_string")
+        st.session_state.azure_storage_account_name = azure_config.get("azure_storage_account_name")
     else:
         st.session_state.azure_storage_connection_string = None
         st.session_state.azure_storage_account_name = None
-    if st.session_state.get('secrets_loaded', False) and azure_config:
+
+    if st.session_state.get('secrets_loaded', False) and azure_config and azure_config.get("azure_openai_key"):
         st.session_state.aoai_client = AzureOpenAI(
             api_key=azure_config["azure_openai_key"],
             api_version="2023-12-01-preview", 
@@ -79,39 +93,68 @@ if 'app_initialized' not in st.session_state:
 
 print("🟢 Starting blob artifacts download process...")
 
-# 1. Authenticate via DefaultAzureCredential
-print("🔑 Acquiring DefaultAzureCredential...")
-credential = DefaultAzureCredential()
-print("✅ Credential acquired.")
+# 1. Authenticate via DefaultAzureCredential (primarily for environments with managed identity)
+service_client = None
+acc_name = st.session_state.get("azure_storage_account_name")
+conn_str = st.session_state.get("azure_storage_connection_string")
 
-# 2. Create BlobServiceClient via AAD
-acc_name = st.session_state.azure_storage_account_name
-account_url = f"https://{acc_name}.blob.core.windows.net"
-print(f"🌐 Connecting to BlobServiceClient at {account_url} using AAD...")
-service_client = BlobServiceClient(account_url=account_url, credential=credential)
-print("✅ AAD-based BlobServiceClient connected.")
+if acc_name:
+    try:
+        print("🔑 Acquiring DefaultAzureCredential for AAD-based Blob Service Client...")
+        credential = DefaultAzureCredential()
+        account_url = f"https://{acc_name}.blob.core.windows.net"
+        print(f"🌐 Attempting to connect to BlobServiceClient at {account_url} using AAD...")
+        service_client = BlobServiceClient(account_url=account_url, credential=credential)
+        # Test connection by listing containers (optional, can be slow or require specific permissions)
+        # list(service_client.list_containers(max_results=1)) 
+        print("✅ AAD-based BlobServiceClient potentially connected (connection will be verified on first use).")
+    except Exception as e:
+        print(f"⚠️ Failed to initialize AAD-based BlobServiceClient (this is okay if connection string is available): {e}")
+        service_client = None # Ensure client is None if AAD auth fails
 
-# 3. Fallback via connection string
-print("🔄 Overriding with connection string auth (if provided)...")
-conn_str = st.session_state.azure_storage_connection_string
+# 2. Fallback or primary authentication via connection string
 if conn_str:
-    service_client = BlobServiceClient.from_connection_string(conn_str)
-    print("✅ BlobServiceClient initialized from connection string.")
+    try:
+        print("🔄 Attempting to initialize BlobServiceClient from connection string...")
+        service_client_conn_str = BlobServiceClient.from_connection_string(conn_str)
+        # Test connection by listing containers (optional)
+        # list(service_client_conn_str.list_containers(max_results=1))
+        service_client = service_client_conn_str # Override with connection string client if successful
+        print("✅ BlobServiceClient initialized successfully from connection string.")
+    except Exception as e:
+        print(f"❌ Failed to initialize BlobServiceClient from connection string: {e}")
+        if not service_client: # If AAD also failed or wasn't attempted
+            st.error("Failed to connect to Azure Blob Storage. Artifacts cannot be downloaded.")
+            st.stop() # Stop the app if no client could be established
 else:
-    print("⚠️ No AZURE_STORAGE_CONNECTION_STRING found; continuing with AAD client.")
+    if not service_client: # If no connection string and AAD client failed or wasn't configured
+        print("⚠️ No AZURE_STORAGE_CONNECTION_STRING found and AAD client failed or not configured; blob download will likely fail.")
+        st.error("Azure Storage configuration missing or invalid. Cannot download app artifacts.")
+        st.stop()
+    else:
+        print("ℹ️ Using AAD-based BlobServiceClient as no connection string was provided.")
 
-# 4. Get ContainerClient
-container_name = "plsworkman"
+
+# 3. Get ContainerClient
+container_name = "plsworkman" # Make sure this container exists and is accessible
 print(f"📦 Getting container client for '{container_name}'...")
-container_client = service_client.get_container_client(container_name)
-print("✅ Container client ready.")
+try:
+    container_client = service_client.get_container_client(container_name)
+    # Test container access (optional)
+    # list(container_client.list_blobs(max_results=1)) 
+    print("✅ Container client ready.")
+except Exception as e:
+    st.error(f"Failed to get container client for '{container_name}'. Check container name and permissions: {e}")
+    print(f"❌ Failed to get container client for '{container_name}': {e}")
+    st.stop()
 
-# 5. Ensure local artifacts folder exists
+
+# 4. Ensure local artifacts folder exists
 print(f"🗂️ Ensuring local artifacts path exists at '{ARTIFACTS_PATH}'...")
 os.makedirs(ARTIFACTS_PATH, exist_ok=True)
 print("✅ Artifacts directory is present.")
 
-# 6. Download each blob
+# 5. Download each blob
 artifact_files = [
     "model.pkl",
     "model_binary_cols.json",
@@ -123,19 +166,21 @@ artifact_files = [
 
 for blob_name in artifact_files:
     download_path = os.path.join(ARTIFACTS_PATH, blob_name)
-    if os.path.isfile(download_path):  # check if file exists :contentReference[oaicite:2]{index=2}
+    if os.path.isfile(download_path):
         print(f"⚡ '{blob_name}' already exists at '{download_path}'; skipping download.")
         continue
 
     print(f"⬇️  Downloading blob '{blob_name}'...")
-    blob_client = container_client.get_blob_client(blob_name)
     try:
+        blob_client = container_client.get_blob_client(blob_name)
         with open(download_path, "wb") as download_file:
-            download_stream = blob_client.download_blob()  # :contentReference[oaicite:3]{index=3}
+            download_stream = blob_client.download_blob()
             download_file.write(download_stream.readall())
         print(f"✅ Successfully downloaded '{blob_name}' to '{download_path}'.")
     except Exception as e:
         print(f"❌ Failed to download '{blob_name}': {e}")
+        st.error(f"Critical error: Failed to download artifact '{blob_name}'. The application might not work correctly. {e}")
+        # Depending on how critical the file is, you might st.stop() here
 
 print("🎉 All done with blob downloads!")
 
@@ -200,7 +245,7 @@ symptom_explanations = {
     "visual_disturbances": "(any problems with your eyesight, like blurriness or seeing spots)", "receiving_blood_transfusion": "(having had blood given to you from someone else)",
     "receiving_unsterile_injections": "(getting shots with needles that weren't clean)", "coma": "(a state of deep unconsciousness)",
     "stomach_bleeding": "(bleeding from your stomach, which might show up in vomit or stool)", "distention_of_abdomen": "(belly feeling bloated, swollen, or stretched out)",
-    "history_of_alcohol_consumption": "(if you drink alcohol and how much)", "fluid_overload.1": "(too much fluid in the body, similar to 'fluid_overload')",
+    "history_of_alcohol_consumption": "(if you drink alcohol and how much)", "fluid_overload.1": "(too much fluid in the body, similar to 'fluid_overload')", # Will be handled
     "blood_in_sputum": "(coughing up blood or bloody mucus)", "prominent_veins_on_calf": "(veins on your lower leg looking large and sticking out)",
     "palpitations": "(feeling your heart beat very fast, hard, or irregularly)", "painful_walking": "(hurting when you walk)",
     "pus_filled_pimples": "(pimples that have pus in them)", "blackheads": "(small, dark bumps on the skin, often on the face)",
@@ -210,7 +255,7 @@ symptom_explanations = {
     "red_sore_around_nose": "(a red, painful spot or sore near your nose)", "yellow_crust_ooze": "(sores that weep a yellowish fluid which then dries into a crust)"
 }
 symptom_explanations = {k.lower().replace(' ', '_'): v for k, v in symptom_explanations.items()}
-if 'fluid_overload.1' in symptom_explanations: # Handle specific case if necessary
+if 'fluid_overload.1' in symptom_explanations: 
     symptom_explanations['fluid_overload_1'] = symptom_explanations.pop('fluid_overload.1')
 
 @st.cache_resource
@@ -238,7 +283,6 @@ def load_application_resources():
             if symptom_code.lower() not in symptom_explanations:
                 symptom_explanations[symptom_code.lower()] = "(No detailed explanation available)"
         
-        # Return model as the first element for clarity
         return (ml_model, binary_cols, disease_names, disease_to_feats, 
                 symptom_to_diseases, original_feature_order, symptom_defaults)
 
@@ -323,7 +367,6 @@ if not resources_loaded:
     st.error("Application resources not available.")
     st.stop()
 
-# Unpack resources, model is now the first element
 (ml_model, binary_cols, disease_names_from_model, disease_to_feats, 
  symptom_to_diseases_map, original_feature_order, symptom_defaults) = st.session_state.app_resources
 
@@ -340,7 +383,6 @@ def set_step(step_name): st.session_state.step = step_name
 
 # --- UI Flow ---
 if st.session_state.step == "initial_input":
-    # ... (initial_input step code remains largely the same as previous version) ...
     if not st.session_state.get('aoai_client'):
         st.error("AI assistant (OpenAI) is unavailable. Please check configuration or try again later.")
     
@@ -380,7 +422,6 @@ if st.session_state.step == "initial_input":
                         st.rerun()
 
 if st.session_state.step == "clarify_symptoms":
-    # ... (clarify_symptoms step code remains largely the same as previous version) ...
     with st.container():
         st.header("💬 Let's Clarify Your Symptoms")
         if st.session_state.initial_symptoms:
@@ -503,28 +544,51 @@ if st.session_state.step == "show_results":
         with col2:
             st.subheader("Potential Insights (from AI Model):")
             with st.spinner("Analyzing your symptoms with our model..."):
-                # Prepare input for the local model
                 input_data_list = [st.session_state.symptom_dict.get(s, 0) for s in original_feature_order]
                 input_df = pd.DataFrame([input_data_list], columns=original_feature_order)
                 
+                sorted_diseases_probs = [] # Initialize to ensure it exists
                 try:
-                    # Use the loaded ml_model directly
-                    probabilities_array = ml_model.predict_proba(input_df)[0] # Get the first (and only) row of probabilities
-                    
-                    # disease_names_from_model was loaded from model_disease_names.json, should match model output
+                    probabilities_array = ml_model.predict_proba(input_df)[0]
                     disease_probs = dict(zip(disease_names_from_model, probabilities_array))
-                    sorted_diseases_probs = sorted(disease_probs.items(), key=lambda x: -x[1]) # Sort by prob desc
+                    sorted_diseases_probs = sorted(disease_probs.items(), key=lambda x: -x[1])
 
-                    if not any(p > 0.01 for _, p in sorted_diseases_probs[:5]):
+                    if not any(p > 0.01 for _, p in sorted_diseases_probs[:5]): # Check if any top 5 have prob > 1%
                          st.info("Based on the information provided, the model did not strongly point to any specific conditions from its knowledge base.")
                     else:
                         st.markdown("Our model suggests the following conditions might be worth considering with a healthcare professional. **Please remember, these are not diagnoses.**")
-                        for disease, prob in sorted_diseases_probs[:5]: 
-                            if prob > 0.01:
+                        
+                        top_5_diseases_for_chart = []
+                        for disease, prob in sorted_diseases_probs[:5]:
+                            if prob > 0.01: 
                                 st.write(f"- **{disease.replace('_', ' ').title()}**: Model indicates a {prob:.0%} likelihood based on symptom patterns.")
+                                top_5_diseases_for_chart.append((disease.replace('_', ' ').title(), prob))
+                        
+                        if top_5_diseases_for_chart:
+                            # Create bar chart
+                            chart_df = pd.DataFrame(top_5_diseases_for_chart, columns=['Condition', 'Likelihood'])
+                            
+                            fig, ax = plt.subplots(figsize=(10, 6))
+                            bars = ax.bar(chart_df['Condition'], chart_df['Likelihood'] * 100, color='skyblue')
+                            
+                            for bar in bars:
+                                yval = bar.get_height()
+                                plt.text(bar.get_x() + bar.get_width()/2.0, yval + 1, f'{yval:.0f}%', ha='center', va='bottom')
+
+                            ax.axhline(50, color='red', linestyle='--', linewidth=2, label='50% Likelihood Reference')
+                            ax.set_ylabel('Likelihood (%)')
+                            ax.set_xlabel('Potential Condition')
+                            ax.set_ylim(0, 105) # Ensure y-axis goes up to 100 (or slightly more for labels)
+                            ax.set_title('Top Potential Conditions (Model Insights)')
+                            plt.xticks(rotation=45, ha="right")
+                            ax.legend()
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            st.caption("The 50% line is a general reference; probabilities indicate symptom pattern strength, not definitive diagnosis.")
+
                 except Exception as e:
                     st.error(f"Error during model prediction: {e}")
-                    sorted_diseases_probs = [] # Ensure it's defined for LLM part
+                    # sorted_diseases_probs remains an empty list or its last valid state
 
         st.divider()
 
@@ -532,26 +596,29 @@ if st.session_state.step == "show_results":
             st.subheader("💬 A Little More About What This Might Mean (from AI Assistant):")
             with st.spinner("Asking AI assistant for a general explanation..."):
                 top_cond_llm_parts = []
-                if 'sorted_diseases_probs' in locals() and sorted_diseases_probs: 
+                if sorted_diseases_probs: # Check if sorted_diseases_probs is not empty
                     for d, p in sorted_diseases_probs[:3]: 
                         if p > 0.05: 
                             top_cond_llm_parts.append(f"{d.replace('_', ' ').title()} (model indicated {p:.0%} likelihood)")
                 
-                active_s_text_llm = [s_code.replace('_', ' ').capitalize() for s_code in active_s_codes]
+                active_s_text_llm = [s_code.replace('_', ' ') for s_code in active_s_codes]
                 
                 interpretation_prompt = f"""You are a friendly, empathetic AI health assistant.
                     The user has reported the following symptoms: {', '.join(active_s_text_llm) if active_s_text_llm else "None specifically confirmed"}.
                     A separate pattern-matching model has suggested potential considerations (NOT diagnoses): {', '.join(top_cond_llm_parts) if top_cond_llm_parts else "None were strongly indicated by the model at this time"}.
                     
-                    Please provide a general, reassuring, and easy-to-understand explanation.
+                    Please provide a general, reassuring, and easy-to-understand explanation. Use Markdown for emphasis on key advice and the final disclaimer.
                     1. Briefly acknowledge the user's reported symptoms.
-                    2. Reassure the user. Explain that the 'potential considerations' from the model are based on symptom patterns and are not diagnoses.
-                    3. If specific conditions were listed by the model (in top_cond_llm_parts), briefly and gently mention them as possibilities to discuss with a doctor if symptoms align or cause concern. Do not overstate their certainty. If none were strongly indicated, acknowledge that and emphasize general well-being.
-                    4. Provide general, safe advice for managing mild symptoms (e.g., monitor symptoms, rest, stay hydrated).
-                    5. Strongly emphasize the importance of consulting a doctor for an accurate diagnosis and treatment plan, especially if symptoms are severe, worsening, persistent, or if the user is worried.
-                    6. Conclude with a clear and prominent disclaimer: "Important Reminder: I am an AI assistant designed for informational purposes only and cannot provide medical advice or a diagnosis. The information shared should not replace consultation with a qualified healthcare professional. Always seek the advice of your physician or other qualified health provider with any questions you may have regarding a medical condition."
+                    2. Reassure the user. Explain that the 'potential considerations' from the model are based on symptom patterns and are **not diagnoses**.
+                    3. If specific conditions were listed by the model (in `top_cond_llm_parts`), briefly and gently mention them as possibilities to discuss with a doctor if symptoms align or cause concern. Do not overstate their certainty. If none were strongly indicated, acknowledge that and emphasize general well-being.
+                    4. **If applicable, based on the types of conditions mentioned (e.g., if the model suggested 'Acne' or 'Psoriasis', you might suggest a dermatologist; if 'Arthritis', a rheumatologist; if 'Bronchial Asthma', a pulmonologist or primary care physician), suggest the type of medical specialist a person *might* consult. Frame these as general suggestions, for example: "For persistent skin concerns like those sometimes associated with [Condition X], a dermatologist is often the specialist to see." or "If joint pain similar to what's seen in [Condition Y] is a primary concern, consulting a rheumatologist could be helpful." Always add that a primary care doctor is a good first point of contact. If no specific conditions are highlighted, or if they are very general, you can skip specific specialist suggestions or just advise seeing a primary care physician for guidance.**
+                    5. Provide general, safe advice for managing mild symptoms (e.g., monitor symptoms, rest, stay hydrated).
+                    6. **Offer brief, actionable advice on preparing for a doctor's visit, for example: "When you see a doctor, it can be helpful to: \n    - Write down all your symptoms and when they started. \n    - List any medications or supplements you're taking. \n    - Note any questions you have for the doctor."**
+                    7. **Strongly emphasize the importance of consulting a doctor for an accurate diagnosis and treatment plan**, especially if symptoms are severe, worsening, persistent, or if the user is worried.
+                    8. Conclude with a clear and prominent disclaimer, using Markdown for emphasis: "**Important Reminder: I am an AI assistant designed for informational purposes only and cannot provide medical advice or a diagnosis. The information shared should not replace consultation with a qualified healthcare professional. Always seek the advice of your physician or other qualified health provider with any questions you may have regarding a medical condition.**"
                     
-                    Keep your tone calm, supportive, and easy to read. Avoid medical jargon where possible or explain it simply."""
+                    Keep your tone calm, supportive, and easy to read. Avoid medical jargon where possible or explain it simply. Make sure key takeaways, like specialist suggestions (if any) and the advice for seeing a doctor, are clearly presented, perhaps using bold text or bullet points for readability as appropriate.
+                    """
                 
                 messages = [{"role": "system", "content": "You are a helpful and empathetic AI assistant focused on health information."},
                             {"role": "user", "content": interpretation_prompt}]
@@ -561,6 +628,10 @@ if st.session_state.step == "show_results":
                     st.markdown(interpretation)
                 else: 
                     st.warning("Could not get a detailed explanation from the AI assistant at this time. Please see the general advice below.")
+                    st.markdown("""**Important Reminder:** This tool is for informational purposes only and does not provide a medical diagnosis. 
+                                It's always best to consult with a qualified healthcare professional for any health concerns or before making any decisions related to your health.
+                                If you are feeling unwell, please monitor your symptoms, rest, and stay hydrated. If your symptoms are severe, worsen, or persist, or if you are worried, seek medical advice promptly.""")
+
         else:
             st.markdown("""**Important Reminder:** This tool is for informational purposes only and does not provide a medical diagnosis. 
                           It's always best to consult with a qualified healthcare professional for any health concerns or before making any decisions related to your health.
@@ -574,9 +645,9 @@ if st.session_state.step == "show_results":
                 if key in st.session_state: del st.session_state[key]
             
             if 'app_resources' in st.session_state:
-                _symptom_defaults = st.session_state.app_resources[6] # symptom_defaults is now 7th item (index 6)
+                _symptom_defaults = st.session_state.app_resources[6] 
                 st.session_state.symptom_dict = _symptom_defaults.copy()
-            elif 'original_feature_order' in globals():
+            elif 'original_feature_order' in globals(): # Fallback if resources somehow not in session
                 st.session_state.symptom_dict = {col: 0 for col in original_feature_order}
             st.rerun()
 
